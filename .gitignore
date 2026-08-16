@@ -1,0 +1,8 @@
+/target
+.env
+*.local
+*.log
+
+# Local database / tooling
+*.sqlite3
+.pgdata/
