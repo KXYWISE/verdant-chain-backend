@@ -1,8 +1,10 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use std::sync::Arc;
 use tower::ServiceExt;
 
+use verdant_backend::farmers::chain::StubChain;
 use verdant_backend::{AppState, app, connect, migrate};
 
 async fn test_state() -> AppState {
@@ -11,7 +13,8 @@ async fn test_state() -> AppState {
         .await
         .expect("connect to test database");
     migrate(&pool).await.expect("run migrations");
-    AppState::new(pool)
+    let chain = Arc::new(StubChain::new());
+    AppState::new(pool, chain)
 }
 
 #[tokio::test]
