@@ -61,8 +61,9 @@ src/
 ├── lib.rs         # library root: app construction + router
 ├── config.rs      # typed environment-based configuration
 ├── error.rs       # uniform AppError -> HTTP responses
-├── state.rs       # shared application state (DB pool)
-└── routes/        # HTTP route modules (health, ...)
+├── state.rs       # shared application state (DB pool, chain client)
+├── farmers/       # Farmer domain (model, service, chain, hash, ids)
+└── routes/        # HTTP route modules (health, farmers)
 migrations/        # SQLx migrations
 tests/             # integration tests
 ```
@@ -70,6 +71,6 @@ tests/             # integration tests
 ## Roadmap status
 
 - [x] Phase 1: repository foundation, base tooling, health + DB smoke test
-- [ ] Shared identifier formats (draft in `docs/architecture/identifiers.md`)
-- [ ] Phase 2: shared cross-repo contracts (coordination with Agent #4)
-- [ ] Phase 3: core agricultural identity — Farmer domain
+- [x] Shared identifier formats (accepted v1.0 in `docs/architecture/identifiers.md`, AD-009)
+- [x] Phase 2: shared cross-repo contracts (Agent #4 published Farmer API)
+- [x] Phase 3: core agricultural identity — Farmer domain (REST API, metadata hashing, DB schema)
