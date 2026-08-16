@@ -2,7 +2,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use verdant_backend::{AppState, Config, app, connect, migrate};
+use verdant_backend::{AppState, Config, app, build_chain, connect, migrate};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,7 +20,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = connect(&config.database_url).await?;
     migrate(&pool).await?;
 
-    let state = AppState::new(pool);
+    let chain = build_chain(&config);
+    let state = AppState::new(pool, chain);
     let app = app(state);
 
     let listener = tokio::net::TcpListener::bind(config.addr()).await?;

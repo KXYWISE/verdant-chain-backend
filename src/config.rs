@@ -7,6 +7,7 @@ pub struct Config {
     pub port: u16,
     pub log_level: String,
     pub database_url: String,
+    pub chain: String,
 }
 
 impl Config {
@@ -22,11 +23,13 @@ impl Config {
         let log_level =
             env::var("VERDANT_BACKEND_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
         let database_url = env::var("DATABASE_URL").map_err(|_| ConfigError::MissingDatabaseUrl)?;
+        let chain = env::var("VERDANT_BACKEND_CHAIN").unwrap_or_else(|_| "stub".to_string());
         Ok(Self {
             host,
             port,
             log_level,
             database_url,
+            chain,
         })
     }
 
@@ -34,7 +37,6 @@ impl Config {
         SocketAddr::new(self.host, self.port)
     }
 }
-
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("DATABASE_URL environment variable is not set")]
