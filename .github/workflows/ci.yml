@@ -48,6 +48,12 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features native-tls,postgres
+
+      - name: Run database migrations
+        run: sqlx migrate run --database-url "$DATABASE_URL"
+
       - name: Format check
         run: cargo fmt --all -- --check
 

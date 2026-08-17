@@ -1,11 +1,14 @@
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
 use utoipa::OpenApi;
 
 use crate::error::AppError;
 use crate::farmers::model::{Farmer, RegisterFarmerRequest, UpdateMetadataRequest};
-use crate::farmers::service::{get_farmer, register_farmer, update_metadata};
+use crate::farmers::service::{
+    FarmerSearchResponse, get_farmer, register_farmer, search_farmers, update_metadata,
+};
 use crate::state::AppState;
 
 const ACTOR_HEADER: &str = "x-verdant-actor";
@@ -16,6 +19,23 @@ fn actor_from_headers(headers: &HeaderMap) -> Result<String, AppError> {
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .ok_or_else(|| AppError::Unauthorized("missing X-Verdant-Actor header".into()))
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+pub struct SearchFarmersQuery {
+    #[serde(default)]
+    pub q: Option<String>,
+    #[serde(default = "default_page")]
+    pub page: i64,
+    #[serde(default = "default_page_size")]
+    pub page_size: i64,
+}
+
+fn default_page() -> i64 {
+    1
+}
+fn default_page_size() -> i64 {
+    20
 }
 
 /// GET /api/v1/farmers/:address
@@ -87,11 +107,43 @@ async fn update_metadata_handler(
     Ok(Json(farmer))
 }
 
+/// GET /api/v1/farmers
+#[utoipa::path(
+    get,
+    path = "/api/v1/farmers",
+    params(
+        ("q" = Option<String>, Query, description = "Substring search on name, region, district (case-insensitive)"),
+        ("page" = Option<i64>, Query, description = "1-indexed page number (default 1)"),
+        ("page_size" = Option<i64>, Query, description = "Results per page, max 100 (default 20)")
+    ),
+    responses(
+        (status = 200, description = "Search farmers (AgriScout directory)", body = FarmerSearchResponse),
+        (status = 400, description = "Invalid pagination params"),
+        (status = 500, description = "Infrastructure failure")
+    )
+)]
+async fn search_farmers_handler(
+    State(state): State<AppState>,
+    Query(query): Query<SearchFarmersQuery>,
+) -> Result<Json<FarmerSearchResponse>, AppError> {
+    search_farmers(&state.pool, query.q, query.page, query.page_size)
+        .await
+        .map(Json)
+}
+
 #[derive(OpenApi)]
 #[openapi(
-    paths(get_farmer_handler, register_farmer_handler, update_metadata_handler),
+    paths(
+        get_farmer_handler,
+        register_farmer_handler,
+        update_metadata_handler,
+        search_farmers_handler
+    ),
     components(schemas(
         Farmer,
+        FarmerSearchResponse,
+        crate::farmers::service::FarmerSearchItem,
+        crate::farmers::service::Pagination,
         crate::farmers::model::FarmerMetadata,
         crate::farmers::model::VerificationMarker,
         crate::farmers::model::RegisterFarmerRequest,
@@ -102,6 +154,10 @@ pub struct FarmersApiDoc;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route(
+            "/api/v1/farmers",
+            axum::routing::get(search_farmers_handler),
+        )
         .route(
             "/api/v1/farmers/{address}",
             axum::routing::get(get_farmer_handler),
