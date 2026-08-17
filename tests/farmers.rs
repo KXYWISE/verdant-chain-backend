@@ -27,6 +27,10 @@ async fn test_state() -> AppState {
         .await
         .expect("connect to test database");
     migrate(&pool).await.expect("run migrations");
+    sqlx::query("TRUNCATE farmers, documents")
+        .execute(&pool)
+        .await
+        .expect("clean farmers and documents tables");
     let chain = Arc::new(StubChain::new());
     AppState::new(pool, chain)
 }
@@ -380,4 +384,176 @@ async fn register_provided_metadata_hash_mismatch_returns_400() {
 async fn body_to_json(response: axum::http::Response<axum::body::Body>) -> serde_json::Value {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&body).unwrap()
+}
+
+async fn register_farmer(state: AppState, n: u8, name: &str, region: &str) {
+    let addr = test_address(n);
+    let body = json!({
+        "address": addr,
+        "metadata": { "name": name, "region": region }
+    });
+    let response = app(state)
+        .oneshot(
+            add_actor(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/farmers/register")
+                    .header("content-type", "application/json"),
+                &addr,
+            )
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn search_farmers_by_name_substring() {
+    let state = test_state().await;
+    register_farmer(state.clone(), 11, "Sahel Grain Cooperative", "Tillabéri").await;
+    register_farmer(state.clone(), 12, "Zinder Dairy Union", "Zinder").await;
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/farmers?q=dairy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_to_json(response).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], "Zinder Dairy Union");
+    assert_eq!(items[0]["address"], test_address(12));
+    assert_eq!(items[0]["id"], test_id(12));
+    assert_eq!(items[0]["region"], "Zinder");
+    assert_eq!(json["pagination"]["total"], 1);
+    assert_eq!(json["pagination"]["totalPages"], 1);
+}
+
+#[tokio::test]
+async fn search_farmers_by_region_case_insensitive() {
+    let state = test_state().await;
+    register_farmer(state.clone(), 13, "Sahel Grain Cooperative", "Tillabéri").await;
+    register_farmer(state.clone(), 14, "Zinder Dairy Union", "zinder").await;
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/farmers?q=ZINDER")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_to_json(response).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["name"], "Zinder Dairy Union");
+}
+
+#[tokio::test]
+async fn search_farmers_no_match_returns_empty() {
+    let state = test_state().await;
+    register_farmer(state.clone(), 15, "Sahel Grain Cooperative", "Tillabéri").await;
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/farmers?q=nonexistent")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_to_json(response).await;
+    assert_eq!(json["items"].as_array().unwrap().len(), 0);
+    assert_eq!(json["pagination"]["total"], 0);
+    assert_eq!(json["pagination"]["totalPages"], 1);
+}
+
+#[tokio::test]
+async fn search_farmers_empty_q_returns_all() {
+    let state = test_state().await;
+    register_farmer(state.clone(), 16, "Sahel Grain Cooperative", "Tillabéri").await;
+    register_farmer(state.clone(), 17, "Zinder Dairy Union", "Zinder").await;
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/farmers")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_to_json(response).await;
+    assert_eq!(json["items"].as_array().unwrap().len(), 2);
+    assert_eq!(json["pagination"]["total"], 2);
+    assert_eq!(json["pagination"]["pageSize"], 20);
+}
+
+#[tokio::test]
+async fn search_farmers_pagination_clamps_page_size() {
+    let state = test_state().await;
+    register_farmer(state.clone(), 18, "Sahel Grain Cooperative", "Tillabéri").await;
+    register_farmer(state.clone(), 19, "Zinder Dairy Union", "Zinder").await;
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/farmers?q=&page=1&pageSize=500")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_to_json(response).await;
+    assert_eq!(json["pagination"]["pageSize"], 100);
+    assert_eq!(json["pagination"]["totalPages"], 1);
+    assert_eq!(json["items"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn search_farmers_pages_results() {
+    let state = test_state().await;
+    for n in 21..25u8 {
+        register_farmer(state.clone(), n, &format!("Farmer {n}"), "Niger").await;
+    }
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/farmers?page=1&pageSize=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_to_json(response).await;
+    assert_eq!(json["items"].as_array().unwrap().len(), 2);
+    assert_eq!(json["pagination"]["total"], 4);
+    assert_eq!(json["pagination"]["totalPages"], 2);
 }

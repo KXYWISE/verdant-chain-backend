@@ -5,7 +5,7 @@ use crate::error::AppError;
 
 pub const FARMER_ID_PREFIX: &str = "va:farmer:";
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct FarmerMetadata {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

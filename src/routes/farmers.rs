@@ -27,7 +27,7 @@ pub struct SearchFarmersQuery {
     pub q: Option<String>,
     #[serde(default = "default_page")]
     pub page: i64,
-    #[serde(default = "default_page_size")]
+    #[serde(default = "default_page_size", rename = "pageSize")]
     pub page_size: i64,
 }
 

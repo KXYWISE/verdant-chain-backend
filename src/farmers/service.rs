@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::PgPool;
 use tracing::debug;
+use utoipa::ToSchema;
 
 use crate::error::AppError;
 use crate::farmers::chain::{ChainError, IdentityChain};
@@ -173,6 +175,142 @@ fn map_chain_error(e: ChainError) -> AppError {
         ChainError::NotFound => AppError::NotFound("farmer not found on-chain".into()),
         ChainError::Internal(msg) => AppError::Internal(msg),
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct FarmerSearchItem {
+    pub address: String,
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub district: Option<String>,
+    #[serde(rename = "verificationCount")]
+    pub verification_count: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema, Default)]
+pub struct Pagination {
+    pub page: i64,
+    #[serde(rename = "pageSize")]
+    pub page_size: i64,
+    pub total: i64,
+    #[serde(rename = "totalPages")]
+    pub total_pages: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema, Default)]
+pub struct FarmerSearchResponse {
+    pub items: Vec<FarmerSearchItem>,
+    pub pagination: Pagination,
+}
+
+#[derive(sqlx::FromRow)]
+struct FarmerSearchRow {
+    address: String,
+    id: String,
+    metadata: serde_json::Value,
+    verification_markers: serde_json::Value,
+}
+
+pub async fn search_farmers(
+    pool: &PgPool,
+    q: Option<String>,
+    page: i64,
+    page_size: i64,
+) -> Result<FarmerSearchResponse, AppError> {
+    let page = page.max(1);
+    let page_size = page_size.clamp(1, 100);
+    let offset = (page - 1) * page_size;
+
+    let search_pattern = q.unwrap_or_default();
+    let like_pattern = format!("%{}%", search_pattern);
+
+    let (total, rows) = if search_pattern.is_empty() {
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM farmers")
+            .fetch_one(pool)
+            .await
+            .map_err(AppError::Database)?;
+
+        let rows = sqlx::query_as::<_, FarmerSearchRow>(
+            r#"
+            SELECT address, id, metadata, verification_markers
+            FROM farmers
+            ORDER BY created_at DESC
+            LIMIT $1 OFFSET $2
+            "#,
+        )
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        (total, rows)
+    } else {
+        let total: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM farmers
+            WHERE (metadata->>'name') ILIKE $1
+               OR (metadata->>'region') ILIKE $1
+               OR (metadata->>'district') ILIKE $1
+            "#,
+        )
+        .bind(like_pattern.clone())
+        .fetch_one(pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        let rows = sqlx::query_as::<_, FarmerSearchRow>(
+            r#"
+            SELECT address, id, metadata, verification_markers
+            FROM farmers
+            WHERE (metadata->>'name') ILIKE $1
+               OR (metadata->>'region') ILIKE $1
+               OR (metadata->>'district') ILIKE $1
+            ORDER BY created_at DESC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(like_pattern)
+        .bind(page_size)
+        .bind(offset)
+        .fetch_all(pool)
+        .await
+        .map_err(AppError::Database)?;
+
+        (total, rows)
+    };
+
+    let total_pages = ((total + page_size - 1) / page_size).max(1);
+
+    let items = rows
+        .into_iter()
+        .map(|row| {
+            let metadata: FarmerMetadata = serde_json::from_value(row.metadata).unwrap_or_default();
+            let markers: Vec<FarmerMarkerRow> =
+                serde_json::from_value(row.verification_markers).unwrap_or_default();
+            FarmerSearchItem {
+                address: row.address,
+                id: row.id,
+                name: metadata.name,
+                region: metadata.region,
+                district: metadata.district,
+                verification_count: markers.len() as i64,
+            }
+        })
+        .collect();
+
+    Ok(FarmerSearchResponse {
+        items,
+        pagination: Pagination {
+            page,
+            page_size,
+            total,
+            total_pages,
+        },
+    })
 }
 
 #[cfg(test)]
