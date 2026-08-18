@@ -2,6 +2,8 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod farmers;
+pub mod ids;
+pub mod indexer;
 pub mod routes;
 pub mod state;
 
