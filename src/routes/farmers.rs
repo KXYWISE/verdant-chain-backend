@@ -1,25 +1,15 @@
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use utoipa::OpenApi;
 
+use crate::auth::extractor::AuthUser;
 use crate::error::AppError;
 use crate::farmers::model::{Farmer, RegisterFarmerRequest, UpdateMetadataRequest};
 use crate::farmers::service::{
     FarmerSearchResponse, get_farmer, register_farmer, search_farmers, update_metadata,
 };
 use crate::state::AppState;
-
-const ACTOR_HEADER: &str = "x-verdant-actor";
-
-fn actor_from_headers(headers: &HeaderMap) -> Result<String, AppError> {
-    headers
-        .get(ACTOR_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| AppError::Unauthorized("missing X-Verdant-Actor header".into()))
-}
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct SearchFarmersQuery {
@@ -67,17 +57,16 @@ async fn get_farmer_handler(
     responses(
         (status = 201, description = "Farmer registered", body = Farmer),
         (status = 400, description = "Invalid address, empty name, or bad metadataHash"),
-        (status = 401, description = "Actor header missing or does not match farmer"),
+        (status = 401, description = "Bearer token missing/invalid or authenticated address does not match farmer"),
         (status = 409, description = "Farmer already registered")
     )
 )]
 async fn register_farmer_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    actor: AuthUser,
     Json(req): Json<RegisterFarmerRequest>,
 ) -> Result<(axum::http::StatusCode, Json<Farmer>), AppError> {
-    let actor = actor_from_headers(&headers)?;
-    let farmer = register_farmer(&state.pool, state.chain.as_ref(), req, &actor).await?;
+    let farmer = register_farmer(&state.pool, state.chain.as_ref(), req, &actor.address).await?;
     Ok((axum::http::StatusCode::CREATED, Json(farmer)))
 }
 
@@ -92,18 +81,24 @@ async fn register_farmer_handler(
     responses(
         (status = 200, description = "Updated farmer record", body = Farmer),
         (status = 400, description = "Invalid address or empty name"),
-        (status = 401, description = "Actor header missing or does not match farmer"),
+        (status = 401, description = "Bearer token missing/invalid or authenticated address does not match farmer"),
         (status = 404, description = "Unknown farmer")
     )
 )]
 async fn update_metadata_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    actor: AuthUser,
     Path(address): Path<String>,
     Json(req): Json<UpdateMetadataRequest>,
 ) -> Result<Json<Farmer>, AppError> {
-    let actor = actor_from_headers(&headers)?;
-    let farmer = update_metadata(&state.pool, state.chain.as_ref(), &address, req, &actor).await?;
+    let farmer = update_metadata(
+        &state.pool,
+        state.chain.as_ref(),
+        &address,
+        req,
+        &actor.address,
+    )
+    .await?;
     Ok(Json(farmer))
 }
 
