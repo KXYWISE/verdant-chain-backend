@@ -21,7 +21,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     migrate(&pool).await?;
 
     let chain = build_chain(&config);
-    let state = AppState::new(pool, chain);
+    let state = AppState::new(pool, chain)
+        .with_domain(&config.domain)
+        .with_session_ttl(config.session_ttl);
     let app = app(state);
 
     let listener = tokio::net::TcpListener::bind(config.addr()).await?;
