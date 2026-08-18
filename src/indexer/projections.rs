@@ -5,6 +5,7 @@ use crate::indexer::model::ChainEvent;
 
 pub const VERIFICATION_PREFIX: &str = "va:verification";
 pub const ESCROW_PREFIX: &str = "va:escrow";
+pub const FINANCING_PREFIX: &str = "va:financing";
 
 /// Decoded verification events (docs/events/verification.md).
 #[derive(Debug, Clone)]
@@ -58,6 +59,45 @@ pub struct EscrowRefunded {
     pub updated_ledger: i64,
 }
 
+/// Decoded financing events (docs/contracts/financing.md, accepted v1.0).
+#[derive(Debug, Clone)]
+pub struct FinancingCreated {
+    pub financing_id: u64,
+    pub funder: String,
+    pub beneficiary: String,
+    pub total_amount: i64,
+    pub drawn_amount: i64,
+    pub milestone_count: i32,
+    pub milestones: serde_json::Value,
+    pub drawn_ledger: Option<i64>,
+    pub repaid_amount: i64,
+    pub defaulted: bool,
+    pub defaulted_ledger: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FinancingDeposited {
+    pub financing_id: u64,
+    /// Increment to the running drawn_amount (event semantics, accepted v1.0).
+    pub amount: i64,
+    pub updated_ledger: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FinancingReleased {
+    pub financing_id: u64,
+    pub released_amount: i64,
+    pub updated_ledger: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FinancingRefunded {
+    pub financing_id: u64,
+    pub refunded_amount: i64,
+    pub defaulted: bool,
+    pub defaulted_ledger: Option<i64>,
+}
+
 /// Raw JSON array access helpers for decoded payloads.
 fn arr(data: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
     data.as_array()
@@ -77,6 +117,10 @@ fn get_i64(data: &serde_json::Value, i: usize) -> Option<i64> {
 
 fn get_i32(data: &serde_json::Value, i: usize) -> Option<i32> {
     arr(data)?.get(i)?.as_i64().map(|v| v as i32)
+}
+
+fn get_bool(data: &serde_json::Value, i: usize) -> Option<bool> {
+    arr(data)?.get(i)?.as_bool()
 }
 
 /// Renders a backend-issued UUIDv7 reference from its hex bytes:
@@ -148,6 +192,54 @@ pub fn decode_escrow_refunded(event: &ChainEvent) -> Option<EscrowRefunded> {
     })
 }
 
+/// Financing `FinancingCreated` carries the full `Financing` struct as data
+/// (docs/contracts/financing.md §events). Financing id is also topic[0].
+pub fn decode_financing_created(event: &ChainEvent) -> Option<FinancingCreated> {
+    let data = &event.data;
+    let financing_id = get_u64(data, 0)?;
+    Some(FinancingCreated {
+        financing_id,
+        funder: get_str(data, 1)?,
+        beneficiary: get_str(data, 2)?,
+        total_amount: get_i64(data, 3)?,
+        drawn_amount: get_i64(data, 4)?,
+        milestone_count: get_i32(data, 5)?,
+        milestones: arr(data)?.get(6)?.clone(),
+        drawn_ledger: get_i64(data, 7),
+        repaid_amount: get_i64(data, 8)?,
+        defaulted: get_bool(data, 9)?,
+        defaulted_ledger: get_i64(data, 10),
+    })
+}
+
+pub fn decode_financing_deposited(event: &ChainEvent) -> Option<FinancingDeposited> {
+    let data = &event.data;
+    Some(FinancingDeposited {
+        financing_id: get_u64(data, 0)?,
+        amount: get_i64(data, 1)?,
+        updated_ledger: get_i64(data, 2)?,
+    })
+}
+
+pub fn decode_financing_released(event: &ChainEvent) -> Option<FinancingReleased> {
+    let data = &event.data;
+    Some(FinancingReleased {
+        financing_id: get_u64(data, 0)?,
+        released_amount: get_i64(data, 1)?,
+        updated_ledger: get_i64(data, 2)?,
+    })
+}
+
+pub fn decode_financing_refunded(event: &ChainEvent) -> Option<FinancingRefunded> {
+    let data = &event.data;
+    Some(FinancingRefunded {
+        financing_id: get_u64(data, 0)?,
+        refunded_amount: get_i64(data, 1)?,
+        defaulted: get_bool(data, 2)?,
+        defaulted_ledger: get_i64(data, 3),
+    })
+}
+
 /// Applies a raw event to the projections it belongs to. Returns true if the
 /// event was consumed by a builder. Idempotent for replays.
 pub async fn apply_event(pool: &PgPool, event: &ChainEvent) -> Result<bool, sqlx::Error> {
@@ -200,6 +292,30 @@ pub async fn apply_event(pool: &PgPool, event: &ChainEvent) -> Result<bool, sqlx
         }
         ("identity", "VerificationMarkerSet") => {
             append_identity_marker(pool, event).await?;
+            Ok(true)
+        }
+        ("financing", "FinancingCreated") => {
+            let decoded = decode_financing_created(event)
+                .ok_or(sqlx::Error::Protocol("bad FinancingCreated payload".into()))?;
+            upsert_financing(pool, &event.contract_id, &decoded).await?;
+            Ok(true)
+        }
+        ("financing", "FinancingDeposited") => {
+            let decoded = decode_financing_deposited(event)
+                .ok_or(sqlx::Error::Protocol("bad FinancingDeposited payload".into()))?;
+            add_financing_deposit(pool, &decoded).await?;
+            Ok(true)
+        }
+        ("financing", "FinancingReleased") => {
+            let decoded = decode_financing_released(event)
+                .ok_or(sqlx::Error::Protocol("bad FinancingReleased payload".into()))?;
+            release_financing(pool, &decoded).await?;
+            Ok(true)
+        }
+        ("financing", "FinancingRefunded") => {
+            let decoded = decode_financing_refunded(event)
+                .ok_or(sqlx::Error::Protocol("bad FinancingRefunded payload".into()))?;
+            refund_financing(pool, &decoded).await?;
             Ok(true)
         }
         _ => Ok(false),
@@ -355,6 +471,114 @@ async fn refund_escrow(pool: &PgPool, e: &EscrowRefunded) -> Result<(), sqlx::Er
     Ok(())
 }
 
+async fn upsert_financing(
+    pool: &PgPool,
+    contract_id: &str,
+    e: &FinancingCreated,
+) -> Result<(), sqlx::Error> {
+    let id = counter_id(FINANCING_PREFIX, e.financing_id);
+    sqlx::query!(
+        r#"
+        INSERT INTO indexer.financing_projection
+            (id, contract_id, funder, beneficiary, total_amount, drawn_amount,
+             milestone_count, milestones, drawn_ledger, repaid_amount, defaulted,
+             defaulted_ledger, updated_ledger, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                CASE WHEN $11 THEN 'defaulted' ELSE 'active' END)
+        ON CONFLICT (id) DO UPDATE SET
+            contract_id = EXCLUDED.contract_id,
+            funder = EXCLUDED.funder,
+            beneficiary = EXCLUDED.beneficiary,
+            total_amount = EXCLUDED.total_amount,
+            drawn_amount = EXCLUDED.drawn_amount,
+            milestone_count = EXCLUDED.milestone_count,
+            milestones = EXCLUDED.milestones,
+            drawn_ledger = EXCLUDED.drawn_ledger,
+            repaid_amount = EXCLUDED.repaid_amount,
+            defaulted = EXCLUDED.defaulted,
+            defaulted_ledger = EXCLUDED.defaulted_ledger,
+            updated_ledger = EXCLUDED.updated_ledger,
+            updated_at = NOW()
+        "#,
+        id,
+        contract_id,
+        e.funder,
+        e.beneficiary,
+        e.total_amount,
+        e.drawn_amount,
+        e.milestone_count,
+        e.milestones,
+        e.drawn_ledger,
+        e.repaid_amount,
+        e.defaulted,
+        e.defaulted_ledger,
+        e.drawn_ledger,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn add_financing_deposit(pool: &PgPool, e: &FinancingDeposited) -> Result<(), sqlx::Error> {
+    let id = counter_id(FINANCING_PREFIX, e.financing_id);
+    sqlx::query!(
+        r#"
+        UPDATE indexer.financing_projection
+        SET drawn_amount = drawn_amount + $2, updated_ledger = $3, updated_at = NOW()
+        WHERE id = $1
+        "#,
+        id,
+        e.amount,
+        e.updated_ledger,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn release_financing(pool: &PgPool, e: &FinancingReleased) -> Result<(), sqlx::Error> {
+    let id = counter_id(FINANCING_PREFIX, e.financing_id);
+    sqlx::query!(
+        r#"
+        UPDATE indexer.financing_projection
+        SET drawn_amount = drawn_amount + $2, drawn_ledger = $3, updated_ledger = $3,
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+        id,
+        e.released_amount,
+        e.updated_ledger,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn refund_financing(pool: &PgPool, e: &FinancingRefunded) -> Result<(), sqlx::Error> {
+    let id = counter_id(FINANCING_PREFIX, e.financing_id);
+    sqlx::query!(
+        r#"
+        UPDATE indexer.financing_projection
+        SET status = CASE
+                WHEN $2 THEN 'defaulted'
+                ELSE 'refunded'
+            END,
+            defaulted = $2,
+            defaulted_ledger = COALESCE($3, defaulted_ledger),
+            drawn_amount = GREATEST(drawn_amount - $4, 0),
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+        id,
+        e.defaulted,
+        e.defaulted_ledger,
+        e.refunded_amount,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Identity projection maintains the on-chain fields of the existing `farmers`
 /// table (address, registered, created/updated ledger, verification_markers).
 /// Data is the `Farmer` struct (object form, docs/contracts/farmer-identity.md):
@@ -454,9 +678,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ESCROW_PREFIX, VERIFICATION_PREFIX, decode_escrow_created, decode_escrow_deposited,
-        decode_escrow_refunded, decode_escrow_released, decode_verification_created,
-        decode_verification_revoked, render_uuid7_ref,
+        ESCROW_PREFIX, FINANCING_PREFIX, VERIFICATION_PREFIX, decode_escrow_created,
+        decode_escrow_deposited, decode_escrow_refunded, decode_escrow_released,
+        decode_financing_created, decode_financing_deposited, decode_financing_refunded,
+        decode_financing_released, decode_verification_created, decode_verification_revoked,
+        render_uuid7_ref,
     };
     use crate::ids::{counter_id, parse_counter_id};
     use crate::indexer::model::ChainEvent;
@@ -545,6 +771,62 @@ mod tests {
             decode_escrow_refunded(&refunded).unwrap().updated_ledger,
             100_030
         );
+    }
+
+    #[test]
+    fn decodes_financing_created() {
+        let ev = event(
+            "FinancingCreated",
+            json!([
+                7,
+                "GFUNDER",
+                "GBENEFICIARY",
+                50_000_000_000i64,
+                10_000_000_000i64,
+                2,
+                json!([{ "index": 1, "deadline_ledger": 100_100, "proof_hash": "aa", "proof_amount": 10_000_000_000i64 }]),
+                100_000,
+                0,
+                false,
+                null
+            ]),
+        );
+        let decoded = decode_financing_created(&ev).unwrap();
+        assert_eq!(decoded.financing_id, 7);
+        assert_eq!(decoded.funder, "GFUNDER");
+        assert_eq!(decoded.beneficiary, "GBENEFICIARY");
+        assert_eq!(decoded.total_amount, 50_000_000_000);
+        assert_eq!(decoded.drawn_amount, 10_000_000_000);
+        assert_eq!(decoded.milestone_count, 2);
+        assert_eq!(decoded.milestones[0]["proof_amount"], 10_000_000_000i64);
+        assert_eq!(
+            counter_id(FINANCING_PREFIX, decoded.financing_id),
+            "va:financing:000000000007"
+        );
+    }
+
+    #[test]
+    fn decodes_financing_mutations() {
+        let deposited = event("FinancingDeposited", json!([7, 5_000_000_000i64, 100_010]));
+        assert_eq!(
+            decode_financing_deposited(&deposited).unwrap().amount,
+            5_000_000_000
+        );
+
+        let released = event("FinancingReleased", json!([7, 3_000_000_000i64, 100_020]));
+        assert_eq!(
+            decode_financing_released(&released).unwrap().released_amount,
+            3_000_000_000
+        );
+
+        let refunded = event(
+            "FinancingRefunded",
+            json!([7, 2_000_000_000i64, true, 100_030]),
+        );
+        let decoded = decode_financing_refunded(&refunded).unwrap();
+        assert_eq!(decoded.refunded_amount, 2_000_000_000);
+        assert!(decoded.defaulted);
+        assert_eq!(decoded.defaulted_ledger, Some(100_030));
     }
 
     #[test]

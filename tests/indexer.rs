@@ -42,7 +42,8 @@ async fn test_pool() -> sqlx::PgPool {
     migrate(&pool).await.expect("run migrations");
     sqlx::query(
         "TRUNCATE indexer.indexed_events, indexer.indexer_cursors, \
-         indexer.verification_projection, indexer.escrow_projection, farmers, documents",
+         indexer.verification_projection, indexer.escrow_projection, \
+         indexer.financing_projection, farmers, documents",
     )
     .execute(&pool)
     .await
@@ -208,6 +209,81 @@ async fn escrow_projection_accumulates_deposits_releases_refunds() {
         row.booking_ref,
         Some("va:booking:018f0c2a-0000-7000-8000-000000000000".into())
     );
+}
+
+#[tokio::test]
+async fn financing_projection_tracks_drawdown_and_default() {
+    let pool = test_pool().await;
+    let source = Arc::new(StubEventSource::new());
+
+    source.push(event(
+        "financing",
+        "FinancingCreated",
+        100_000,
+        json!([
+            7,
+            "GFUNDER",
+            "GBENEFICIARY",
+            50_000_000_000i64,
+            10_000_000_000i64,
+            2,
+            json!([{ "index": 1, "deadline_ledger": 100_100, "proof_hash": "aa", "proof_amount": 10_000_000_000i64 }]),
+            100_000,
+            0,
+            false,
+            null
+        ]),
+        json!([7]),
+    ));
+    source.push(event(
+        "financing",
+        "FinancingDeposited",
+        100_010,
+        json!([7, 5_000_000_000i64, 100_010]),
+        json!([7]),
+    ));
+    source.push(event(
+        "financing",
+        "FinancingReleased",
+        100_020,
+        json!([7, 3_000_000_000i64, 100_020]),
+        json!([7]),
+    ));
+    source.push(event(
+        "financing",
+        "FinancingRefunded",
+        100_030,
+        json!([7, 2_000_000_000i64, true, 100_030]),
+        json!([7]),
+    ));
+    source.set_head(100_040);
+
+    service::ingest(&pool, source.as_ref(), "CCONTRACT")
+        .await
+        .expect("ingest");
+
+    let row = sqlx::query!(
+        r#"
+        SELECT funder, beneficiary, total_amount, drawn_amount, milestone_count,
+               repaid_amount, defaulted, defaulted_ledger, status
+        FROM indexer.financing_projection
+        WHERE id = 'va:financing:000000000007'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.funder, "GFUNDER");
+    assert_eq!(row.beneficiary, "GBENEFICIARY");
+    assert_eq!(row.total_amount, 50_000_000_000);
+    // created 10B + deposit 5B + release 3B - refund 2B
+    assert_eq!(row.drawn_amount, 16_000_000_000);
+    assert_eq!(row.milestone_count, 2);
+    assert_eq!(row.repaid_amount, 0);
+    assert!(row.defaulted);
+    assert_eq!(row.defaulted_ledger, Some(100_030));
+    assert_eq!(row.status, "defaulted");
 }
 
 #[tokio::test]
