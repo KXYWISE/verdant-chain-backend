@@ -8,6 +8,8 @@ pub struct Config {
     pub log_level: String,
     pub database_url: String,
     pub chain: String,
+    pub domain: String,
+    pub session_ttl: std::time::Duration,
 }
 
 impl Config {
@@ -24,12 +26,20 @@ impl Config {
             env::var("VERDANT_BACKEND_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
         let database_url = env::var("DATABASE_URL").map_err(|_| ConfigError::MissingDatabaseUrl)?;
         let chain = env::var("VERDANT_BACKEND_CHAIN").unwrap_or_else(|_| "stub".to_string());
+        let domain =
+            env::var("VERDANT_BACKEND_DOMAIN").unwrap_or_else(|_| "app.verdant.example".into());
+        let session_ttl_secs = env::var("VERDANT_BACKEND_SESSION_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7 * 24 * 60 * 60);
         Ok(Self {
             host,
             port,
             log_level,
             database_url,
             chain,
+            domain,
+            session_ttl: std::time::Duration::from_secs(session_ttl_secs),
         })
     }
 
