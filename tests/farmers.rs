@@ -1,24 +1,38 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use base64::Engine as _;
 use http_body_util::BodyExt;
 use serde_json::json;
 use std::sync::Arc;
 use tower::ServiceExt;
 
+use ed25519_dalek::{Signer, SigningKey};
 use stellar_strkey::ed25519::PublicKey;
 use verdant_backend::farmers::chain::StubChain;
 use verdant_backend::{AppState, app, connect, migrate};
 
-fn test_address(n: u8) -> String {
+fn keypair(n: u8) -> (SigningKey, String) {
     let payload = [n; 32];
-    PublicKey::from_payload(&payload)
+    let signing = SigningKey::from_bytes(&payload);
+    let public = PublicKey::from_payload(signing.verifying_key().as_bytes())
         .unwrap()
         .to_string()
-        .to_string()
+        .to_string();
+    (signing, public)
+}
+
+fn test_address(n: u8) -> String {
+    keypair(n).1
 }
 
 fn test_id(n: u8) -> String {
     format!("va:farmer:{}", test_address(n))
+}
+
+fn sep40_message(domain: &str, address: &str, nonce: &str, timestamp: &str) -> String {
+    format!(
+        "{domain} wants you to sign in with your Stellar account:\n{address}\n\nNonce: {nonce}\nIssued At: {timestamp}\n"
+    )
 }
 
 async fn test_state() -> AppState {
@@ -27,21 +41,75 @@ async fn test_state() -> AppState {
         .await
         .expect("connect to test database");
     migrate(&pool).await.expect("run migrations");
-    sqlx::query("TRUNCATE farmers, documents")
+    sqlx::query("TRUNCATE auth_challenges, auth_sessions, farmers, documents")
         .execute(&pool)
         .await
-        .expect("clean farmers and documents tables");
+        .expect("clean auth and farmers tables");
     let chain = Arc::new(StubChain::new());
     AppState::new(pool, chain)
 }
 
-fn add_actor(builder: axum::http::request::Builder, address: &str) -> axum::http::request::Builder {
-    builder.header("x-verdant-actor", address)
+/// Establishes a session for keypair `n` and returns a bearer token.
+async fn establish_session(state: &AppState, n: u8) -> String {
+    let (signing, addr) = keypair(n);
+
+    let challenge = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/challenge")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "address": addr }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(challenge.status(), StatusCode::OK);
+    let challenge = body_to_json(challenge).await;
+
+    let domain = challenge["domain"].as_str().unwrap();
+    let nonce = challenge["nonce"].as_str().unwrap();
+    let timestamp = challenge["timestamp"].as_str().unwrap();
+    let signature = base64::engine::general_purpose::STANDARD.encode(
+        signing
+            .try_sign(sep40_message(domain, &addr, nonce, timestamp).as_bytes())
+            .unwrap()
+            .to_bytes(),
+    );
+
+    let verify = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/verify")
+                .header("content-type", "application/json")
+                .body(
+                    json!({
+                        "address": addr,
+                        "domain": domain,
+                        "nonce": nonce,
+                        "timestamp": timestamp,
+                        "signature": signature
+                    })
+                    .to_string(),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(verify.status(), StatusCode::OK);
+    let verify = body_to_json(verify).await;
+    verify["token"].as_str().unwrap().to_string()
+}
+
+fn add_bearer(builder: axum::http::request::Builder, token: &str) -> axum::http::request::Builder {
+    builder.header("authorization", format!("Bearer {token}"))
 }
 
 #[tokio::test]
 async fn register_farmer_returns_201_with_va_id() {
     let state = test_state().await;
+    let token = establish_session(&state, 1).await;
     let addr = test_address(1);
     let id = test_id(1);
     let body = json!({
@@ -50,12 +118,12 @@ async fn register_farmer_returns_201_with_va_id() {
     });
     let response = app(state)
         .oneshot(
-            add_actor(
+            add_bearer(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/farmers/register")
                     .header("content-type", "application/json"),
-                &addr,
+                &token,
             )
             .body(Body::from(body.to_string()))
             .unwrap(),
@@ -76,22 +144,25 @@ async fn register_farmer_returns_201_with_va_id() {
 #[tokio::test]
 async fn register_duplicate_returns_409() {
     let state = test_state().await;
+    let token = establish_session(&state, 2).await;
     let addr = test_address(2);
     let body = json!({
         "address": addr,
         "metadata": { "name": "Ada Farm Cooperative" }
     });
-    let req = |actor: &str| {
-        Request::builder()
-            .method("POST")
-            .uri("/api/v1/farmers/register")
-            .header("content-type", "application/json")
-            .header("x-verdant-actor", actor)
-            .body(Body::from(body.to_string()))
-            .unwrap()
+    let req = |token: &str| {
+        add_bearer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/farmers/register")
+                .header("content-type", "application/json"),
+            token,
+        )
+        .body(Body::from(body.to_string()))
+        .unwrap()
     };
-    app(state.clone()).oneshot(req(&addr)).await.unwrap();
-    let response = app(state).oneshot(req(&addr)).await.unwrap();
+    app(state.clone()).oneshot(req(&token)).await.unwrap();
+    let response = app(state).oneshot(req(&token)).await.unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let json = body_to_json(response).await;
     assert_eq!(json["error"], "farmer already registered");
@@ -100,6 +171,7 @@ async fn register_duplicate_returns_409() {
 #[tokio::test]
 async fn get_farmer_returns_200() {
     let state = test_state().await;
+    let token = establish_session(&state, 3).await;
     let addr = test_address(3);
     let id = test_id(3);
     let body = json!({
@@ -108,12 +180,12 @@ async fn get_farmer_returns_200() {
     });
     app(state.clone())
         .oneshot(
-            add_actor(
+            add_bearer(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/farmers/register")
                     .header("content-type", "application/json"),
-                &addr,
+                &token,
             )
             .body(Body::from(body.to_string()))
             .unwrap(),
@@ -140,6 +212,7 @@ async fn get_farmer_returns_200() {
 #[tokio::test]
 async fn get_farmer_with_presentation_form() {
     let state = test_state().await;
+    let token = establish_session(&state, 4).await;
     let addr = test_address(4);
     let id = test_id(4);
     let body = json!({
@@ -148,12 +221,12 @@ async fn get_farmer_with_presentation_form() {
     });
     app(state.clone())
         .oneshot(
-            add_actor(
+            add_bearer(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/farmers/register")
                     .header("content-type", "application/json"),
-                &addr,
+                &token,
             )
             .body(Body::from(body.to_string()))
             .unwrap(),
@@ -196,6 +269,7 @@ async fn get_unknown_farmer_returns_404() {
 #[tokio::test]
 async fn update_metadata_returns_200_with_new_hash() {
     let state = test_state().await;
+    let token = establish_session(&state, 5).await;
     let addr = test_address(5);
     let body = json!({
         "address": addr,
@@ -203,12 +277,12 @@ async fn update_metadata_returns_200_with_new_hash() {
     });
     app(state.clone())
         .oneshot(
-            add_actor(
+            add_bearer(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/farmers/register")
                     .header("content-type", "application/json"),
-                &addr,
+                &token,
             )
             .body(Body::from(body.to_string()))
             .unwrap(),
@@ -221,12 +295,12 @@ async fn update_metadata_returns_200_with_new_hash() {
     });
     let response = app(state)
         .oneshot(
-            add_actor(
+            add_bearer(
                 Request::builder()
                     .method("PUT")
                     .uri(format!("/api/v1/farmers/{addr}/metadata"))
                     .header("content-type", "application/json"),
-                &addr,
+                &token,
             )
             .body(Body::from(update_body.to_string()))
             .unwrap(),
@@ -243,6 +317,7 @@ async fn update_metadata_returns_200_with_new_hash() {
 #[tokio::test]
 async fn update_metadata_wrong_actor_returns_401() {
     let state = test_state().await;
+    let token = establish_session(&state, 6).await;
     let addr = test_address(6);
     let body = json!({
         "address": addr,
@@ -250,12 +325,12 @@ async fn update_metadata_wrong_actor_returns_401() {
     });
     app(state.clone())
         .oneshot(
-            add_actor(
+            add_bearer(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/farmers/register")
                     .header("content-type", "application/json"),
-                &addr,
+                &token,
             )
             .body(Body::from(body.to_string()))
             .unwrap(),
@@ -263,15 +338,17 @@ async fn update_metadata_wrong_actor_returns_401() {
         .await
         .unwrap();
 
+    // A session for a *different* address cannot update this farmer.
+    let other_token = establish_session(&state, 60).await;
     let update_body = json!({ "metadata": { "name": "Hacker" } });
     let response = app(state)
         .oneshot(
-            add_actor(
+            add_bearer(
                 Request::builder()
                     .method("PUT")
                     .uri(format!("/api/v1/farmers/{addr}/metadata"))
                     .header("content-type", "application/json"),
-                "GOTHERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+                &other_token,
             )
             .body(Body::from(update_body.to_string()))
             .unwrap(),
@@ -283,7 +360,7 @@ async fn update_metadata_wrong_actor_returns_401() {
 }
 
 #[tokio::test]
-async fn register_missing_actor_returns_401() {
+async fn register_missing_bearer_returns_401() {
     let state = test_state().await;
     let addr = test_address(7);
     let body = json!({
@@ -307,18 +384,19 @@ async fn register_missing_actor_returns_401() {
 #[tokio::test]
 async fn register_invalid_address_returns_400() {
     let state = test_state().await;
+    let token = establish_session(&state, 8).await;
     let body = json!({
         "address": "not-a-valid-stellar-key",
         "metadata": { "name": "Ada Farm Cooperative" }
     });
     let response = app(state)
         .oneshot(
-            add_actor(
+            add_bearer(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/farmers/register")
                     .header("content-type", "application/json"),
-                "not-a-valid-stellar-key",
+                &token,
             )
             .body(Body::from(body.to_string()))
             .unwrap(),
@@ -331,19 +409,20 @@ async fn register_invalid_address_returns_400() {
 #[tokio::test]
 async fn register_empty_name_returns_400() {
     let state = test_state().await;
-    let addr = test_address(8);
+    let token = establish_session(&state, 9).await;
+    let addr = test_address(9);
     let body = json!({
         "address": addr,
         "metadata": { "name": "" }
     });
     let response = app(state)
         .oneshot(
-            add_actor(
+            add_bearer(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/farmers/register")
                     .header("content-type", "application/json"),
-                &addr,
+                &token,
             )
             .body(Body::from(body.to_string()))
             .unwrap(),
@@ -356,7 +435,8 @@ async fn register_empty_name_returns_400() {
 #[tokio::test]
 async fn register_provided_metadata_hash_mismatch_returns_400() {
     let state = test_state().await;
-    let addr = test_address(9);
+    let token = establish_session(&state, 10).await;
+    let addr = test_address(10);
     let body = json!({
         "address": addr,
         "metadata": { "name": "Ada Farm Cooperative" },
@@ -364,12 +444,12 @@ async fn register_provided_metadata_hash_mismatch_returns_400() {
     });
     let response = app(state)
         .oneshot(
-            add_actor(
+            add_bearer(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/farmers/register")
                     .header("content-type", "application/json"),
-                &addr,
+                &token,
             )
             .body(Body::from(body.to_string()))
             .unwrap(),
@@ -387,6 +467,7 @@ async fn body_to_json(response: axum::http::Response<axum::body::Body>) -> serde
 }
 
 async fn register_farmer(state: AppState, n: u8, name: &str, region: &str) {
+    let token = establish_session(&state, n).await;
     let addr = test_address(n);
     let body = json!({
         "address": addr,
@@ -394,12 +475,12 @@ async fn register_farmer(state: AppState, n: u8, name: &str, region: &str) {
     });
     let response = app(state)
         .oneshot(
-            add_actor(
+            add_bearer(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/farmers/register")
                     .header("content-type", "application/json"),
-                &addr,
+                &token,
             )
             .body(Body::from(body.to_string()))
             .unwrap(),
