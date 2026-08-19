@@ -301,20 +301,23 @@ pub async fn apply_event(pool: &PgPool, event: &ChainEvent) -> Result<bool, sqlx
             Ok(true)
         }
         ("financing", "FinancingDeposited") => {
-            let decoded = decode_financing_deposited(event)
-                .ok_or(sqlx::Error::Protocol("bad FinancingDeposited payload".into()))?;
+            let decoded = decode_financing_deposited(event).ok_or(sqlx::Error::Protocol(
+                "bad FinancingDeposited payload".into(),
+            ))?;
             add_financing_deposit(pool, &decoded).await?;
             Ok(true)
         }
         ("financing", "FinancingReleased") => {
-            let decoded = decode_financing_released(event)
-                .ok_or(sqlx::Error::Protocol("bad FinancingReleased payload".into()))?;
+            let decoded = decode_financing_released(event).ok_or(sqlx::Error::Protocol(
+                "bad FinancingReleased payload".into(),
+            ))?;
             release_financing(pool, &decoded).await?;
             Ok(true)
         }
         ("financing", "FinancingRefunded") => {
-            let decoded = decode_financing_refunded(event)
-                .ok_or(sqlx::Error::Protocol("bad FinancingRefunded payload".into()))?;
+            let decoded = decode_financing_refunded(event).ok_or(sqlx::Error::Protocol(
+                "bad FinancingRefunded payload".into(),
+            ))?;
             refund_financing(pool, &decoded).await?;
             Ok(true)
         }
@@ -815,7 +818,9 @@ mod tests {
 
         let released = event("FinancingReleased", json!([7, 3_000_000_000i64, 100_020]));
         assert_eq!(
-            decode_financing_released(&released).unwrap().released_amount,
+            decode_financing_released(&released)
+                .unwrap()
+                .released_amount,
             3_000_000_000
         );
 
