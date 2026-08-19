@@ -1,4 +1,6 @@
 use sqlx::PgPool;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::info;
 
 use crate::indexer::chain::{ChainEvents, ChainEventsError};
@@ -9,6 +11,25 @@ use crate::indexer::store;
 /// Trusted finality cutoff (ledgers): projection writes finalize only for
 /// ledger_sequence older than head - cutoff (Agent #4 decision, Q1).
 pub const TRUSTED_CUTOFF: i64 = 10;
+
+/// Poll interval for the background indexer loop.
+pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Spawns the background ingestion loop: for each configured contract, pulls
+/// new events and applies finality-gated projections on every tick. Logs
+/// transient errors and keeps polling.
+pub fn spawn_indexer(pool: PgPool, source: Arc<dyn ChainEvents>, contract_ids: Vec<String>) {
+    tokio::spawn(async move {
+        loop {
+            for contract_id in &contract_ids {
+                if let Err(err) = ingest(&pool, source.as_ref(), contract_id).await {
+                    tracing::warn!(contract_id, %err, "indexer ingest error");
+                }
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    });
+}
 
 /// Ingests new events for a contract: pulls from the event source, appends
 /// to the raw store, advances the cursor, and applies finality-gated

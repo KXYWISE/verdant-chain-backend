@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
 
@@ -10,6 +11,25 @@ pub struct Config {
     pub chain: String,
     pub domain: String,
     pub session_ttl: std::time::Duration,
+    /// Soroban RPC endpoint used by the real event indexer
+    /// (`VERDANT_BACKEND_RPC_URL`), empty when running on the stub chain.
+    pub rpc_url: String,
+    /// contract_id (`C…`) → indexer contract name
+    /// (`VERDANT_BACKEND_INDEXER_CONTRACTS`, `name:contract,name:contract`).
+    pub indexer_contracts: HashMap<String, String>,
+}
+
+/// Parses `name:contract,name:contract` into contract-id → name.
+fn parse_contracts(raw: &str) -> HashMap<String, String> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let (name, contract) = pair.split_once(':')?;
+            let name = name.trim();
+            let contract = contract.trim();
+            (!name.is_empty() && !contract.is_empty())
+                .then(|| (contract.to_string(), name.to_string()))
+        })
+        .collect()
 }
 
 impl Config {
@@ -32,6 +52,10 @@ impl Config {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(7 * 24 * 60 * 60);
+        let rpc_url = env::var("VERDANT_BACKEND_RPC_URL").unwrap_or_else(|_| "".to_string());
+        let indexer_contracts = parse_contracts(
+            &env::var("VERDANT_BACKEND_INDEXER_CONTRACTS").unwrap_or_else(|_| "".to_string()),
+        );
         Ok(Self {
             host,
             port,
@@ -40,6 +64,8 @@ impl Config {
             chain,
             domain,
             session_ttl: std::time::Duration::from_secs(session_ttl_secs),
+            rpc_url,
+            indexer_contracts,
         })
     }
 
@@ -51,4 +77,24 @@ impl Config {
 pub enum ConfigError {
     #[error("DATABASE_URL environment variable is not set")]
     MissingDatabaseUrl,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_contracts;
+
+    #[test]
+    fn parses_indexer_contracts() {
+        let map = parse_contracts("verification:CDEBUG,escrow:C2,financing:C3");
+        assert_eq!(map.get("CDEBUG"), Some(&"verification".to_string()));
+        assert_eq!(map.get("C2"), Some(&"escrow".to_string()));
+        assert_eq!(map.get("C3"), Some(&"financing".to_string()));
+        assert_eq!(map.len(), 3);
+    }
+
+    #[test]
+    fn skips_empty_contract_pairs() {
+        let map = parse_contracts("verification:CDEBUG,,escrow:");
+        assert_eq!(map.len(), 1);
+    }
 }
