@@ -1,46 +1,48 @@
-# VerdAnt Backend — Project Proposal
+# VerdAnt Backend
 
 **Server APIs, business logic, data, and authentication for the VerdAnt
 ecosystem — open agricultural technology & financial infrastructure built on
 Stellar/Soroban.**
 
-**Document status:** 2026-08-18 · Revision 2
-**Owner:** Agent #1 (Backend Engineer)
-**Part of:** the VerdAnt three-repository system (this repo, `verdant-contracts`,
-`verdant-frontend`).
+This repository implements the farmer domain (AgriScout identity), SEP-40
+wallet authentication, and the off-chain event indexer that rebuilds
+projections from Soroban contract events.
 
----
+## Prerequisites
 
-## 1. Background
+- Rust (stable)
+- PostgreSQL running locally
+- `cargo-sqlx` (`cargo install sqlx-cli`) for migrations
 
-VerdAnt anchors farm identity, verification, equipment leasing, financing, and
-livestock provenance on the Stellar blockchain. For that vision to serve real
-users, there must be a reliable, well-defined server layer: one that authenticates
-wallets, serves the farmer domain, and turns raw on-chain contract activity into
-queryable off-chain projections. This repository is that layer.
+## Setup
 
-## 2. Objectives
+```bash
+# 1. Create the database
+createdb verdant_backend
 
-1. Provide a typed, documented REST API for the farmer domain (AgriScout
-   identity) with pagination and search.
-2. Authenticate Stellar wallets via SEP-40 (challenge / signature verification /
-   bearer sessions) and gate farmer routes on that identity.
-3. Ingest Soroban contract events and rebuild off-chain projections (identity,
-   verification, escrow) for discovery and search.
-4. Keep on-chain/off-chain responsibilities separated: integrity-sensitive state
-   stays on-chain; the backend manages data, search, and API presentation.
+# 2. Configure environment
+cp .env.example .env
 
-## 3. Scope
+# 3. Run migrations
+cargo sqlx migrate run --source migrations
 
-**In scope.** Farmer registration/profile/search, SEP-40 wallet authentication,
-bearer-token session management, event indexing and projections, PostgreSQL
-schema, health/ops endpoints, OpenAPI contract output, CI.
+# 4. Start the server
+cargo run
+```
 
-**Out of scope.** On-chain state (handled by `verdant-contracts`); frontend
-surfaces (handled by `verdant-frontend`); a live Soroban RPC subscriber — the
-indexer currently runs on a `StubEventSource` until the real chain is live.
+Open http://127.0.0.1:8080/health to confirm the server is up.
 
-## 4. Proposed solution & architecture
+## Scripts
+
+| Command | Purpose |
+|---------|---------|
+| `cargo run` | Start the server |
+| `cargo sqlx migrate run --source migrations` | Apply database migrations |
+| `cargo test` | Run tests |
+| `cargo fmt --check` | Check formatting |
+| `cargo clippy --all-targets -- -D warnings` | Lint with warnings as errors |
+
+## Architecture
 
 ```
                     ┌─────────────────────────────────────────────┐
@@ -78,89 +80,56 @@ indexer currently runs on a `StubEventSource` until the real chain is live.
   authenticate via the `AuthUser` extractor.
 - The event indexer ingests Soroban contract events into an append-only
   `indexer.indexed_events` store and rebuilds derived projections (identity,
-  verification, escrow), with a finality cutoff and re-org rewind.
+  verification, escrow, financing), with a finality cutoff and re-org rewind.
 
-**Stack.** Rust (edition 2021) · Axum · tokio · PostgreSQL · SQLx
-(compile-time-checked SQL) · tracing · utoipa (OpenAPI) · stellar-strkey ·
-ed25519-dalek + base64 (SEP-40 signature verification).
+## Route map
 
-## 5. Deliverables
+| Route | Method | Purpose |
+|-------|--------|---------|
+| `/health` | GET | Health check |
+| `/api/v1/auth/challenge` | POST | Issue a SEP-40 challenge `{ address }` → `{ domain, nonce, timestamp, address }` |
+| `/api/v1/auth/verify` | POST | Verify a Stellar signature → `{ token, address, roles, expires_at }` |
+| `/api/v1/auth/session` | GET | Fetch the session for a bearer token |
+| `/api/v1/farmers` | GET | Search farmers (AD-010: `q`, `page`, `pageSize`) |
+| `/api/v1/farmers/:address` | GET | Farmer profile |
+| `/api/v1/farmers/register` | POST | Register a farmer |
+| `/api/v1/farmers/:address/metadata` | PUT | Update farmer metadata |
 
-### 5.1 Delivered
+Farmer routes require a bearer token (SEP-40 session). The canonical contract
+for these endpoints is `docs/api/farmers.md` in the coordination root.
 
-- **Farmer REST API v1.1** — register / get / update / search (AD-010:
-  `q`, `page`, `pageSize`), with GIN/trigram search indexes.
-- **SEP-40 wallet auth** — `POST /api/v1/auth/challenge`, `POST
-  /api/v1/auth/verify`, `GET /api/v1/auth/session`; bearer sessions gated by the
-  `AuthUser` axum extractor on farmer routes.
-- **Event indexer foundation** — migration `0005_indexer.sql`, `ChainEvents`
-  trait, identity/verification/escrow projections, idempotent re-ingest, re-org
-  rewind.
-- **PostgreSQL schema** — migrations 0001–0005 covering baseline, farmers,
-  search indexes, auth, and the dedicated `indexer` schema.
-- **Health endpoint** and uniform `AppError` → HTTP error mapping.
+## Features
 
-### 5.2 Planned
+### SEP-40 wallet authentication
 
-- Real Soroban RPC subscriber behind `ChainEvents` (deferred until the real
-  chain is live).
-- Projection → API read endpoints (awaiting frontend contracts).
-- Financing projection (awaiting contract deployment).
-- Publish OpenAPI output to the coordination `docs/api/` tree.
+The backend implements the SEP-40 signed-payload flow:
 
-## 6. Design constraints & standards
+1. `POST /api/v1/auth/challenge` issues a single-use challenge containing the
+   domain, a nonce, and a timestamp.
+2. The wallet signs the challenge message (built by `sep40_message`).
+3. `POST /api/v1/auth/verify` verifies the ed25519 signature and returns a
+   bearer token.
+4. Farmer routes authenticate via the `AuthUser` axum extractor, which resolves
+   the bearer token against `auth_sessions`.
 
-- **On-chain/off-chain boundary (AD-004).** Only integrity-sensitive state goes
-  on-chain; documents/media stay off-chain referenced by sha256 hashes.
-- **Identifiers (AD-009).** Backend renders contract-issued IDs as 12-digit
-  zero-padded `u64` counters (`va:verification:000000000042`) and issues its own
-  UUIDv7 reference keys (`va:batch:`, `va:booking:`, `va:asset:`). On-chain keys
-  are never `va:`-prefixed.
-- **Auth.** SEP-40 signed-payload flow; `X-Verdant-Actor` header was dropped in
-  favor of the `AuthUser` bearer-token middleware (no fallback).
-- **Interface-first.** API contracts are documented in the coordination
-  `docs/api/` tree before implementation and are the contract of record for the
-  frontend. Changes require an agent note and, if architecturally significant,
-  an architecture decision (AD).
+### Farmer API (AgriScout)
 
-## 7. Timeline / roadmap
+Register, read, update, and search farmers. Metadata is hashed (sha256, AD-004)
+before any on-chain call. Search uses GIN/trigram indexes (AD-010) with
+pagination.
 
-| Phase | Scope | Status |
-|-------|-------|--------|
-| 1 | Repository foundation, tooling, health + DB smoke test | Done |
-| — | Shared identifier formats (AD-009) | Done |
-| 2 | Shared cross-repo API contracts v1.1 | Done |
-| 3 | Farmer REST API (register/get/update/search), metadata hashing, schema | Done |
-| — | SEP-40 wallet auth + `AuthUser` middleware on farmer routes | Done |
-| 9 | Event indexer foundation (migration 0005, `ChainEvents`, projections) | Done |
-| 9 | Live Soroban RPC subscriber | Pending |
-| — | Projection read endpoints | Pending |
-| — | Financing projection | Pending |
+### Event indexer
 
-## 8. Development & operations
+Ingests Soroban contract events and rebuilds off-chain projections:
 
-### Local development
+- Raw events appended idempotently to `indexer.indexed_events`.
+- Finality cutoff (10 ledgers) before projection apply.
+- Re-org rewind drops events from the divergent ledger onward and resumes.
+- Projections: identity, verification, escrow, financing.
 
-Prerequisites: Rust (stable), PostgreSQL running locally.
+## Configuration
 
-```bash
-# 1. Create the database
-createdb verdant_backend
-
-# 2. Configure environment
-cp .env.example .env
-
-# 3. Run migrations
-cargo sqlx migrate run --source migrations
-
-# 4. Start the server
-cargo run
-
-# 5. Check health
-curl http://127.0.0.1:8080/health
-```
-
-### Configuration
+Environment variables (see `.env.example`):
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
@@ -171,10 +140,24 @@ curl http://127.0.0.1:8080/health
 | `VERDANT_BACKEND_DOMAIN` | — | Domain used in SEP-40 challenge messages |
 | `VERDANT_BACKEND_SESSION_TTL_SECS` | — | Bearer session TTL (seconds) |
 
-### Tests
+## Database schema (migrations)
 
-Integration tests need a dedicated database and CI uses a serial test runner to
-avoid cross-binary interference:
+| Migration | Content |
+|-----------|---------|
+| `0001_baseline.sql` | Baseline / platform tables |
+| `0002_farmers.sql` | `farmers` table (on-chain fields + metadata block) |
+| `0003_farmer_search_indexes.sql` | GIN/trigram indexes for AD-010 search |
+| `0004_auth.sql` | `auth_challenges`, `auth_sessions` |
+| `0005_indexer.sql` | `indexer` schema: `indexed_events`, `indexer_cursors`, verification/escrow projections |
+| `0006_financing_projection.sql` | `indexer.financing_projection` table + indexes |
+
+Indexer tables live in a dedicated `indexer` schema, separate from the `public`
+API tables.
+
+## Tests
+
+Integration tests need a dedicated database, and CI uses a serial test runner
+to avoid cross-binary interference:
 
 ```bash
 createdb verdant_backend_test
@@ -182,23 +165,25 @@ DATABASE_URL=postgres://postgres@127.0.0.1:5432/verdant_backend_test \
   cargo test --all-targets -- --test-threads=1
 ```
 
-Current suite: **50 tests green** — 18 lib unit (incl. indexer decoders/chain/
-ids), 8 auth, 17 farmers, 2 health, 5 indexer integration. Indexer coverage:
-verification finality + cutoff, escrow accumulate/release/refund, identity
-upsert, idempotent re-ingest, and re-org rewind.
+Current suite: **53 tests green** — lib unit (incl. indexer decoders/chain/
+ids), auth, farmers, health, and indexer integration. Indexer coverage:
+verification finality + cutoff, escrow accumulate/release/refund, financing
+drawdown/default, identity upsert, idempotent re-ingest, and re-org rewind.
 
-### Lint / format / CI
+## Lint / format
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
-GitHub Actions (`ci.yml`): Postgres service container, `sqlx migrate run`, then
-`fmt --check`, `clippy -D warnings`, and `cargo test --all-targets --
---test-threads=1`.
+## CI/CD
 
-## 9. Project layout
+GitHub Actions (`.github/workflows/ci.yml`): a Postgres service container,
+`sqlx migrate run`, then `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, and `cargo test --all-targets -- --test-threads=1`.
+
+## Project layout
 
 ```
 src/
@@ -225,19 +210,24 @@ src/
 │   ├── model.rs       #   ChainEvent, Cursor, projection row types
 │   ├── store.rs       #   idempotent raw-event append, cursors, re-org rewind
 │   ├── service.rs     #   ingest (finality cutoff, projection apply)
-│   ├── projections.rs #   identity / verification / escrow builders
+│   ├── projections.rs #   identity / verification / escrow / financing builders
 │   └── mod.rs
 └── routes/            # HTTP route modules
     ├── health.rs      #   GET /health
     ├── auth.rs        #   POST /api/v1/auth/challenge|verify, GET .../session
     ├── farmers.rs     #   farmer REST + search endpoints
     └── mod.rs
-migrations/            # SQLx migrations (0001..0005)
+migrations/            # SQLx migrations (0001..0006)
 tests/                 # integration tests (auth, farmers, health, indexer)
 ```
 
-## 10. Ownership
+## Contributing
 
-Owned and maintained by **Agent #1 (Backend Engineer)** as part of the VerdAnt
-program. Interface contracts are coordinated through the program's integration
-lead (Agent #4) and recorded in the coordination root.
+1. Fork the repo and create a branch from `main`.
+2. Install deps, run migrations, and verify: `cargo fmt --check`, `cargo clippy
+   --all-targets -- -D warnings`, and the test suite.
+3. Open a pull request. CI runs format, lint, and tests on push/PR to `main`.
+
+## License
+
+MIT

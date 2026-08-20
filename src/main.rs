@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -19,6 +21,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pool = connect(&config.database_url).await?;
     migrate(&pool).await?;
+
+    if !config.rpc_url.is_empty() && !config.indexer_contracts.is_empty() {
+        let source = Arc::new(verdant_backend::indexer::RpcEventSource::new(
+            &config.rpc_url,
+            config.indexer_contracts.clone(),
+        )?);
+        let contract_ids: Vec<String> = config.indexer_contracts.keys().cloned().collect();
+        verdant_backend::indexer::service::spawn_indexer(pool.clone(), source, contract_ids);
+        tracing::info!(
+            rpc_url = %config.rpc_url,
+            contracts = ?config.indexer_contracts.keys().collect::<Vec<_>>(),
+            "indexer subscriber started"
+        );
+    } else {
+        tracing::info!("indexer running on stub chain (no RPC URL configured)");
+    }
 
     let chain = build_chain(&config);
     let state = AppState::new(pool, chain)
