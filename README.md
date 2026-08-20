@@ -230,4 +230,4 @@ tests/                 # integration tests (auth, farmers, health, indexer)
 
 ## License
 
-MIT
+Apache License 2.0. See the `LICENSE` file.
